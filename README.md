@@ -70,15 +70,3 @@ switch_delay_ms = 150
 # ~/.config/hypr/hyprland.conf
 exec-once = hyprxkb
 ```
-
-## Bug fixes vs the original C version
-
-1. **Throttle timer** — in C, `last_switch_ms` was stamped on *every* `activewindow` event, even no-ops (non-English app with no saved layout).  In Rust, the timer is only updated when a layout change is actually triggered.
-
-2. **Save-slot overwrite** — in C, every `save_and_set_first` call unconditionally overwrote `g_saved_layout`, so switching between two English apps lost the original non-English layout.  In Rust, `save_and_set_first` only writes the slot the *first* time (while `saved_layout.is_none()`).
-
-3. **evdev SYNC handling** — in C, `LIBEVDEV_READ_STATUS_SYNC` was handled with the same `LIBEVDEV_READ_FLAG_NORMAL` flag, causing the event buffer to desynchronise.  The Rust `evdev` crate's `fetch_events()` handles the SYNC drain internally.
-
-4. **Blocking OSD** — in C, `osd_notify` called `waitpid` in the calling thread, blocking the event loop until `swayosd-client` exited.  In Rust, `Command::spawn()` returns immediately; the child is reaped by the OS when it exits.
-
-5. **`last_switch_ms` without mutex** — in C this global was read/written from both the main thread and `handle_layer_*` without the lock.  In Rust the timer lives only in `main` (which owns the event loop) so no sharing is needed.

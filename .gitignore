@@ -1,0 +1,7 @@
+# Artifacts 
+/target/
+*.exe
+*.pdb
+*~
+*.swp
+*.rs.bk

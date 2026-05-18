@@ -1,6 +1,6 @@
-# hyprkbtool
+# hyprxkb
 
-Keyboard layout-switching daemon for [Hyprland](https://hyprland.org/).
+Keyboard layout-switching utility for [Hyprland](https://hyprland.org/).
 
 ## Features
 
@@ -15,7 +15,7 @@ Keyboard layout-switching daemon for [Hyprland](https://hyprland.org/).
 # Release (minimal binary ~200 KB with LTO+strip)
 cargo build --release
 
-# The binary is at target/release/hyprkbtool
+# The binary is at target/release/hyprxkb
 ```
 
 ### Runtime dependencies
@@ -34,7 +34,7 @@ KERNEL=="event*", GROUP="input", MODE="0660"
 
 ## Config
 
-Default location: `~/.config/hyprkbtool/config.toml`  
+Default location: `~/.config/hyprxkb/config.toml`  
 Created automatically on first run.
 
 ```toml
@@ -68,7 +68,7 @@ switch_delay_ms = 150
 
 ```ini
 # ~/.config/hypr/hyprland.conf
-exec-once = hyprkbtool
+exec-once = hyprxkb
 ```
 
 ## Bug fixes vs the original C version

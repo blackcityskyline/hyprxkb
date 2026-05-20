@@ -1,8 +1,8 @@
 [package]
 name        = "hyprxkb"
-version     = "0.2.0"
+version     = "0.3.0"
 edition     = "2021"
-description = "Keyboard layout-switching utility for Hyprland"
+description = "Keyboard layout-switching daemon for Hyprland"
 license     = "MIT"
 
 [[bin]]
@@ -10,14 +10,14 @@ name = "hyprxkb"
 path = "src/main.rs"
 
 [dependencies]
-# TOML parsing — no_std-friendly, zero unsafe, minimal deps
-toml   = { version = "0.8", default-features = false, features = ["parse"] }
-serde  = { version = "1",   default-features = false, features = ["derive"] }
-# evdev — safe Rust bindings (no libevdev C dependency)
-evdev  = { version = "0.12", default-features = false }
+toml        = "1.0"
+serde       = { version = "1.0", features = ["derive"] }
+evdev       = "0.13"
+signal-hook = "0.3"
+libc        = "0.2"
 
 [profile.release]
-opt-level     = "z"   # minimise binary size / instruction cache pressure
+opt-level     = "z"
 lto           = true
 codegen-units = 1
 strip         = true

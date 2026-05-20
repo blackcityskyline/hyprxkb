@@ -1,32 +1,39 @@
-//! evdev thread: discover keyboards, detect hotkey, call `rotate`.
+//! evdev thread: watches raw keyboard input for the configured hotkey and
+//! calls `State::rotate` when it fires.
+//!
+//! Works even on the lock screen because we read `/dev/input` directly.
 
 use crate::{config::Config, layout::State};
-use evdev::{Device, EventType, InputEventKind, Key};
+use evdev::{Device, EventType, KeyCode};
 use std::{
     os::unix::io::AsRawFd,
-    sync::{Arc, Mutex},
+    sync::{Arc, RwLock},
     thread,
     time::{Duration, Instant},
 };
 
-pub fn resolve_key(name: &str) -> Option<Key> {
+// ---------------------------------------------------------------------------
+// Key / modifier resolution
+// ---------------------------------------------------------------------------
+
+pub fn resolve_key(name: &str) -> Option<KeyCode> {
     match name.to_ascii_lowercase().as_str() {
-        "space"  => Some(Key::KEY_SPACE),
-        "tab"    => Some(Key::KEY_TAB),
-        "enter"  => Some(Key::KEY_ENTER),
-        "grave"  => Some(Key::KEY_GRAVE),
-        "minus"  => Some(Key::KEY_MINUS),
-        "equal"  => Some(Key::KEY_EQUAL),
-        "left"   => Some(Key::KEY_LEFT),
-        "right"  => Some(Key::KEY_RIGHT),
-        "up"     => Some(Key::KEY_UP),
-        "down"   => Some(Key::KEY_DOWN),
-        "f1"     => Some(Key::KEY_F1),  "f2"  => Some(Key::KEY_F2),
-        "f3"     => Some(Key::KEY_F3),  "f4"  => Some(Key::KEY_F4),
-        "f5"     => Some(Key::KEY_F5),  "f6"  => Some(Key::KEY_F6),
-        "f7"     => Some(Key::KEY_F7),  "f8"  => Some(Key::KEY_F8),
-        "f9"     => Some(Key::KEY_F9),  "f10" => Some(Key::KEY_F10),
-        "f11"    => Some(Key::KEY_F11), "f12" => Some(Key::KEY_F12),
+        "space" => Some(KeyCode::KEY_SPACE),
+        "tab"   => Some(KeyCode::KEY_TAB),
+        "enter" => Some(KeyCode::KEY_ENTER),
+        "grave" => Some(KeyCode::KEY_GRAVE),
+        "minus" => Some(KeyCode::KEY_MINUS),
+        "equal" => Some(KeyCode::KEY_EQUAL),
+        "left"  => Some(KeyCode::KEY_LEFT),
+        "right" => Some(KeyCode::KEY_RIGHT),
+        "up"    => Some(KeyCode::KEY_UP),
+        "down"  => Some(KeyCode::KEY_DOWN),
+        "f1"    => Some(KeyCode::KEY_F1),  "f2"  => Some(KeyCode::KEY_F2),
+        "f3"    => Some(KeyCode::KEY_F3),  "f4"  => Some(KeyCode::KEY_F4),
+        "f5"    => Some(KeyCode::KEY_F5),  "f6"  => Some(KeyCode::KEY_F6),
+        "f7"    => Some(KeyCode::KEY_F7),  "f8"  => Some(KeyCode::KEY_F8),
+        "f9"    => Some(KeyCode::KEY_F9),  "f10" => Some(KeyCode::KEY_F10),
+        "f11"   => Some(KeyCode::KEY_F11), "f12" => Some(KeyCode::KEY_F12),
         _ => None,
     }
 }
@@ -46,20 +53,25 @@ impl Modifier {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-device modifier tracking
+// ---------------------------------------------------------------------------
+
 #[derive(Default)]
 struct ModState { meta: bool, alt: bool, ctrl: bool, shift: bool }
 
 impl ModState {
-    fn update(&mut self, key: Key, pressed: bool) {
+    fn update(&mut self, key: KeyCode, pressed: bool) {
         match key {
-            Key::KEY_LEFTMETA  | Key::KEY_RIGHTMETA  => self.meta  = pressed,
-            Key::KEY_LEFTALT   | Key::KEY_RIGHTALT   => self.alt   = pressed,
-            Key::KEY_LEFTCTRL  | Key::KEY_RIGHTCTRL  => self.ctrl  = pressed,
-            Key::KEY_LEFTSHIFT | Key::KEY_RIGHTSHIFT => self.shift = pressed,
+            KeyCode::KEY_LEFTMETA  | KeyCode::KEY_RIGHTMETA  => self.meta  = pressed,
+            KeyCode::KEY_LEFTALT   | KeyCode::KEY_RIGHTALT   => self.alt   = pressed,
+            KeyCode::KEY_LEFTCTRL  | KeyCode::KEY_RIGHTCTRL  => self.ctrl  = pressed,
+            KeyCode::KEY_LEFTSHIFT | KeyCode::KEY_RIGHTSHIFT => self.shift = pressed,
             _ => {}
         }
     }
-    fn matches(&self, m: Modifier) -> bool {
+
+    fn is_held(&self, m: Modifier) -> bool {
         match m {
             Modifier::Meta  => self.meta,
             Modifier::Alt   => self.alt,
@@ -69,11 +81,30 @@ impl ModState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Device discovery
+// ---------------------------------------------------------------------------
+
+fn is_keyboard(dev: &Device) -> bool {
+    dev.supported_keys().map_or(false, |keys| {
+        keys.contains(KeyCode::KEY_SPACE) && keys.contains(KeyCode::KEY_LEFTMETA)
+    })
+}
+
+fn set_nonblocking(fd: i32) {
+    // SAFETY: standard fcntl usage on a valid file descriptor.
+    unsafe {
+        extern "C" { fn fcntl(fd: i32, cmd: i32, ...) -> i32; }
+        let flags = fcntl(fd, /* F_GETFL */ 3);
+        fcntl(fd, /* F_SETFL */ 4, flags | /* O_NONBLOCK */ 2048);
+    }
+}
+
 fn find_keyboards() -> Vec<Device> {
-    let mut found = Vec::new();
+    let mut keyboards = Vec::new();
     let dir = match std::fs::read_dir("/dev/input") {
-        Ok(d) => d,
-        Err(e) => { eprintln!("[evdev] read_dir: {}", e); return found; }
+        Ok(d)  => d,
+        Err(e) => { eprintln!("[evdev] read_dir /dev/input: {e}"); return keyboards; }
     };
     for entry in dir.flatten() {
         let path = entry.path();
@@ -81,102 +112,121 @@ fn find_keyboards() -> Vec<Device> {
             continue;
         }
         match Device::open(&path) {
-            Ok(mut dev) => {
-                if dev.supported_keys().map_or(false, |k| {
-                    k.contains(Key::KEY_SPACE) && k.contains(Key::KEY_LEFTMETA)
-                }) {
-                    eprintln!("[evdev] watching: {} ({})", path.display(), dev.name().unwrap_or("?"));
-                    // O_NONBLOCK через fcntl (evdev 0.12 не имеет set_nonblocking)
-                    unsafe { set_nonblocking(dev.as_raw_fd()); }
-                    found.push(dev);
-                }
+            Ok(dev) if is_keyboard(&dev) => {
+                eprintln!("[evdev] watching: {} ({})", path.display(), dev.name().unwrap_or("?"));
+                set_nonblocking(dev.as_raw_fd());
+                keyboards.push(dev);
             }
-            Err(e) if e.raw_os_error() == Some(13) => {} // EACCES — тихо
-            Err(e) => eprintln!("[evdev] open {:?}: {}", path, e),
+            Ok(_)  => {}
+            Err(e) if e.raw_os_error() == Some(libc::EACCES) => {} // no permission — skip silently
+            Err(e) => eprintln!("[evdev] open {path:?}: {e}"),
         }
     }
-    found
+    keyboards
 }
 
-pub fn spawn(cfg: Arc<Config>, state: Arc<Mutex<State>>) {
+// ---------------------------------------------------------------------------
+// poll(2) wrapper
+// ---------------------------------------------------------------------------
+
+fn wait_for_input(devices: &[Device], timeout_ms: i32) -> bool {
+    let mut pollfds: Vec<libc::pollfd> = devices.iter().map(|d| libc::pollfd {
+        fd:      d.as_raw_fd(),
+        events:  libc::POLLIN,
+        revents: 0,
+    }).collect();
+    // SAFETY: pollfds is a valid slice of libc::pollfd.
+    let n = unsafe {
+        libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout_ms)
+    };
+    n > 0
+}
+
+// ---------------------------------------------------------------------------
+// Thread entry point
+// ---------------------------------------------------------------------------
+
+pub fn spawn(cfg: Arc<RwLock<Config>>, state: Arc<RwLock<State>>) {
     thread::Builder::new()
         .name("evdev".into())
         .spawn(move || run(&cfg, &state))
         .expect("spawn evdev thread");
 }
 
-#[repr(C)]
-struct PollFd { fd: i32, events: i16, revents: i16 }
-
-fn poll_wait(fds: &mut Vec<PollFd>, timeout_ms: i32) -> i32 {
-    extern "C" { fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32; }
-    unsafe { poll(fds.as_mut_ptr(), fds.len() as u64, timeout_ms) }
+/// Read the current hotkey config. Returns `None` if the config is invalid.
+fn read_hotkey(cfg: &RwLock<Config>) -> Option<(KeyCode, Modifier)> {
+    let g = cfg.read().unwrap();
+    let key = resolve_key(&g.hotkey.key)?;
+    let m   = Modifier::parse(&g.hotkey.modifier)?;
+    Some((key, m))
 }
 
-unsafe fn set_nonblocking(fd: i32) {
-    extern "C" { fn fcntl(fd: i32, cmd: i32, ...) -> i32; }
-    let flags = fcntl(fd, 3 /* F_GETFL */);
-    fcntl(fd, 4 /* F_SETFL */, flags | 2048 /* O_NONBLOCK */);
-}
-
-fn run(cfg: &Config, state: &Arc<Mutex<State>>) {
-    let target_key = match resolve_key(&cfg.hotkey.key) {
-        Some(k) => k,
-        None => { eprintln!("[evdev] unknown key: {:?}", cfg.hotkey.key); return; }
-    };
-    let modifier = match Modifier::parse(&cfg.hotkey.modifier) {
-        Some(m) => m,
-        None => { eprintln!("[evdev] unknown modifier: {:?}", cfg.hotkey.modifier); return; }
-    };
-
-    let mut devices = find_keyboards();
-    if devices.is_empty() {
-        eprintln!("[evdev] no keyboards found");
-        return;
-    }
-
-    let mut mod_states: Vec<ModState> = (0..devices.len()).map(|_| ModState::default()).collect();
+fn run(cfg: &Arc<RwLock<Config>>, state: &Arc<RwLock<State>>) {
     let debounce = Duration::from_millis(300);
-    let mut last_hotkey = Instant::now()
-        .checked_sub(debounce + Duration::from_millis(1))
-        .unwrap_or_else(Instant::now);
+
+    let mut hotkey:         Option<(KeyCode, Modifier)> = None;
+    let mut devices:        Vec<Device>   = Vec::new();
+    let mut mod_states:     Vec<ModState> = Vec::new();
+    let mut last_hotkey:    Instant       = Instant::now();
+    let mut last_cfg_check: Instant       = Instant::now();
+
+    // Reload hotkey config and re-scan keyboards every 2 s.
+    let refresh = |hotkey: &mut Option<(KeyCode, Modifier)>,
+                       devices: &mut Vec<Device>,
+                       mod_states: &mut Vec<ModState>| {
+        let new_hotkey = read_hotkey(cfg);
+        if *hotkey != new_hotkey {
+            *hotkey = new_hotkey;
+            *devices = find_keyboards();
+            *mod_states = (0..devices.len()).map(|_| ModState::default()).collect();
+            eprintln!("[evdev] hotkey: {hotkey:?}");
+        }
+    };
+
+    refresh(&mut hotkey, &mut devices, &mut mod_states);
 
     loop {
-        // Блокируемся на poll до появления данных (макс 1 сек)
-        let mut pollfds: Vec<PollFd> = devices.iter().map(|d| PollFd {
-            fd: d.as_raw_fd(),
-            events: 0x0001, // POLLIN
-            revents: 0,
-        }).collect();
+        // Periodic config refresh.
+        if last_cfg_check.elapsed() >= Duration::from_secs(2) {
+            last_cfg_check = Instant::now();
+            refresh(&mut hotkey, &mut devices, &mut mod_states);
+        }
 
-        if poll_wait(&mut pollfds, 1000) < 0 {
-            thread::sleep(Duration::from_millis(1));
+        // If configuration is invalid or no keyboards found, back off.
+        let Some((target_key, modifier)) = hotkey else {
+            thread::sleep(Duration::from_secs(1));
+            continue;
+        };
+        if devices.is_empty() {
+            thread::sleep(Duration::from_secs(1));
             continue;
         }
 
-        for (i, pfd) in pollfds.iter().enumerate() {
-            if pfd.revents == 0 { continue; }
+        if !wait_for_input(&devices, 1000) {
+            continue;
+        }
 
-            // Вычитываем ВСЕ накопившиеся события
+        for i in 0..devices.len() {
             loop {
                 match devices[i].fetch_events() {
-                    Err(e) if e.raw_os_error() == Some(11) => break, // EAGAIN — буфер пуст
-                    Err(e) => { eprintln!("[evdev] read error: {}", e); break; }
+                    Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => break,
+                    Err(e) => { eprintln!("[evdev] read error on device {i}: {e}"); break; }
                     Ok(events) => {
                         for ev in events {
                             if ev.event_type() != EventType::KEY { continue; }
-                            let InputEventKind::Key(key) = ev.kind() else { continue };
-                            let value = ev.value(); // 0=up 1=down 2=repeat
+                            let key   = KeyCode::new(ev.code());
+                            let value = ev.value(); // 0 = up, 1 = down, 2 = repeat
 
                             mod_states[i].update(key, value != 0);
 
-                            if key == target_key && value == 1 && mod_states[i].matches(modifier) {
-                                let now = Instant::now();
-                                if now.duration_since(last_hotkey) > debounce {
-                                    last_hotkey = now;
-                                    eprintln!("[evdev] hotkey → rotate");
-                                    state.lock().unwrap().rotate(cfg);
-                                }
+                            let hotkey_fired = key == target_key
+                                && value == 1
+                                && mod_states[i].is_held(modifier);
+
+                            if hotkey_fired && last_hotkey.elapsed() > debounce {
+                                last_hotkey = Instant::now();
+                                eprintln!("[evdev] hotkey → rotate");
+                                state.write().unwrap().rotate(&cfg.read().unwrap());
                             }
                         }
                     }

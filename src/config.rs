@@ -2,276 +2,312 @@
 
 use serde::Deserialize;
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
 
-// ── Default values ────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Notify
+// ---------------------------------------------------------------------------
 
-fn default_device() -> String {
-    "keyd-virtual-keyboard".into()
-}
-fn default_layouts() -> Vec<String> {
-    vec!["en".into(), "ru".into()]
-}
-fn default_modifier() -> String {
-    "Meta".into()
-}
-fn default_key() -> String {
-    "Space".into()
-}
-fn default_osd_enabled() -> bool {
-    true
-}
-fn default_osd_icon() -> String {
-    "input-keyboard-symbolic".into()
-}
-fn default_layer_contains() -> String {
-    "launcher".into()
-}
-fn default_layout_file() -> String {
-    "/tmp/hypr-layout".into()
-}
-fn default_switch_delay_ms() -> u64 {
-    150
+/// Supported notification backends.
+///
+/// `Dunst`, `Mako`, `SwayNc`, and `NotifySend` all call `notify-send` under
+/// the hood — they exist as separate variants only for documentation purposes
+/// and possible future divergence.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NotifyBackend {
+    /// Notifications disabled.
+    #[default]
+    None,
+    /// `swayosd-client` — shows OSD overlays.
+    SwayOsd,
+    /// `notify-send` compatible daemons (dunst, mako, swaync, libnotify).
+    NotifySend,
 }
 
-// ── Sub-tables ────────────────────────────────────────────────────────────────
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct NotifyConfig {
+    pub backend:    NotifyBackend,
+    pub timeout_ms: u64,
+    pub icon:       String,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            backend:    NotifyBackend::None,
+            timeout_ms: 2000,
+            icon:       "input-keyboard-symbolic".into(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CapsLock
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CapsLockConfig {
+    pub enabled: bool,
+    pub poll_ms: u64,
+}
+
+impl Default for CapsLockConfig {
+    fn default() -> Self {
+        Self { enabled: true, poll_ms: 150 }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct KeyboardConfig {
-    #[serde(default = "default_device")]
-    pub device: String,
-    #[serde(default = "default_layouts")]
+    /// The hyprctl device name (see `hyprctl devices`).
+    pub device:  String,
+    /// Layout rotation order — names must match XKB layout names.
     pub layouts: Vec<String>,
 }
 
 impl Default for KeyboardConfig {
     fn default() -> Self {
         Self {
-            device: default_device(),
-            layouts: default_layouts(),
+            device:  "keyd-virtual-keyboard".into(),
+            layouts: vec!["en".into(), "ru".into()],
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hotkey
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct HotkeyConfig {
-    #[serde(default = "default_modifier")]
+    /// `Meta` | `Alt` | `Ctrl` | `Shift`
     pub modifier: String,
-    #[serde(default = "default_key")]
+    /// `Space` | `Tab` | `F1`–`F12` | `Grave` | `Minus` | …
     pub key: String,
 }
 
 impl Default for HotkeyConfig {
     fn default() -> Self {
-        Self {
-            modifier: default_modifier(),
-            key: default_key(),
-        }
+        Self { modifier: "Meta".into(), key: "Space".into() }
     }
 }
 
-/// Per-layout OSD messages: TOML table keyed by layout name,
-/// e.g. `[osd.messages]  en = "🇺🇸 US English"`.
-pub type OsdMessages = std::collections::HashMap<String, String>;
+// ---------------------------------------------------------------------------
+// Force-layout rules
+// ---------------------------------------------------------------------------
 
+/// A single rule that forces a layout for specific apps or layer surfaces.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct OsdConfig {
-    #[serde(default = "default_osd_enabled")]
-    pub enabled: bool,
-    #[serde(default = "default_osd_icon")]
-    pub icon: String,
+pub struct ForceRule {
+    /// Target layout name (must be in `keyboard.layouts`).
+    pub layout: String,
+    /// Exact window class names (lowercased) that trigger this rule.
     #[serde(default)]
-    pub messages: OsdMessages,
-}
-
-impl Default for OsdConfig {
-    fn default() -> Self {
-        let mut messages = std::collections::HashMap::new();
-        messages.insert("en".into(), "🇺🇸 US English".into());
-        messages.insert("ru".into(), "🇷🇺 Russian".into());
-        Self {
-            enabled: default_osd_enabled(),
-            icon: default_osd_icon(),
-            messages,
-        }
-    }
+    pub apps: Vec<String>,
+    /// Exact layer surface names that trigger this rule.
+    #[serde(default)]
+    pub layers: Vec<String>,
+    /// Substring match for layer surface names.
+    #[serde(default)]
+    pub layer_contains: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct AutoSwitchConfig {
-    pub english_apps: Vec<String>,
-    pub english_layers: Vec<String>,
-    #[serde(default = "default_layer_contains")]
-    pub english_layer_contains: String,
+pub struct ForceLayoutConfig {
+    pub rules: Vec<ForceRule>,
 }
 
-impl Default for AutoSwitchConfig {
+impl Default for ForceLayoutConfig {
     fn default() -> Self {
         Self {
-            english_apps: vec![
-                "nvim".into(),
-                "vim".into(),
-                "btop".into(),
-                "htop".into(),
-                "alacritty".into(),
-                "foot".into(),
-                "kitty".into(),
-                "mpv".into(),
-                "pcmanfm".into(),
-            ],
-            english_layers: vec!["rofi".into(), "wofi".into()],
-            english_layer_contains: default_layer_contains(),
+            rules: vec![ForceRule {
+                layout: "en".into(),
+                apps: vec![
+                    "nvim".into(), "vim".into(), "btop".into(), "htop".into(),
+                    "alacritty".into(), "foot".into(), "kitty".into(),
+                    "mpv".into(), "pcmanfm".into(),
+                ],
+                layers:         vec!["rofi".into(), "wofi".into()],
+                layer_contains: "launcher".into(),
+            }],
         }
     }
 }
+
+impl ForceLayoutConfig {
+    pub fn layout_for_class(&self, class: &str) -> Option<&str> {
+        self.rules.iter()
+            .find(|r| r.apps.iter().any(|a| a == class))
+            .map(|r| r.layout.as_str())
+    }
+
+    pub fn layout_for_layer(&self, layer: &str) -> Option<&str> {
+        self.rules.iter()
+            .find(|r| {
+                r.layers.iter().any(|l| l == layer)
+                    || (!r.layer_contains.is_empty() && layer.contains(&r.layer_contains))
+            })
+            .map(|r| r.layout.as_str())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// General
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct GeneralConfig {
-    #[serde(default = "default_layout_file")]
-    pub layout_file: String,
-    #[serde(default = "default_switch_delay_ms")]
+    /// File used to persist the current layout across restarts.
+    pub layout_file:     String,
+    /// Minimum time between layout switches (debounce for Hyprland events).
     pub switch_delay_ms: u64,
 }
 
 impl Default for GeneralConfig {
     fn default() -> Self {
-        Self {
-            layout_file: default_layout_file(),
-            switch_delay_ms: default_switch_delay_ms(),
-        }
+        Self { layout_file: "/tmp/hypr-layout".into(), switch_delay_ms: 150 }
     }
 }
 
-// ── Top-level Config ──────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Root config
+// ---------------------------------------------------------------------------
+
+/// Human-readable display names for each layout (used in notifications).
+/// Key: layout name (e.g. "en"), value: display string (e.g. "🇺🇸 English").
+pub type LayoutMessages = HashMap<String, String>;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
-    pub keyboard:    KeyboardConfig,
-    pub hotkey:      HotkeyConfig,
-    pub osd:         OsdConfig,
-    pub auto_switch: AutoSwitchConfig,
-    pub general:     GeneralConfig,
+    pub keyboard:     KeyboardConfig,
+    pub hotkey:       HotkeyConfig,
+    pub notify:       NotifyConfig,
+    pub capslock:     CapsLockConfig,
+    pub force_layout: ForceLayoutConfig,
+    pub general:      GeneralConfig,
+    pub messages:     LayoutMessages,
 }
 
 impl Config {
-    /// Load from file; on any error fall back to compiled-in defaults and log.
+    /// Load config from `path`, falling back to defaults on any error.
     pub fn load(path: &Path) -> Self {
-        match fs::read_to_string(path) {
+        let text = match fs::read_to_string(path) {
+            Ok(t)  => t,
             Err(e) => {
-                eprintln!("[config] cannot read {:?}: {} — using defaults", path, e);
+                eprintln!("[config] cannot read {path:?}: {e} — using defaults");
+                return Self::default();
+            }
+        };
+        match toml::from_str(&text) {
+            Ok(cfg) => { eprintln!("[config] loaded: {path:?}"); cfg }
+            Err(e)  => {
+                eprintln!("[config] parse error in {path:?}: {e} — using defaults");
                 Self::default()
             }
-            Ok(text) => match toml::from_str::<Self>(&text) {
-                Ok(cfg) => {
-                    eprintln!("[config] loaded: {:?}", path);
-                    cfg
-                }
-                Err(e) => {
-                    eprintln!("[config] parse error in {:?}: {} — using defaults", path, e);
-                    Self::default()
-                }
-            },
         }
     }
 
-    /// Return the OSD message for a given layout name (falls back to the name
-    /// itself so there is always something to display).
-    pub fn osd_message<'a>(&'a self, layout: &'a str) -> &'a str {
-        self.osd
-            .messages
-            .get(layout)
-            .map(String::as_str)
-            .unwrap_or(layout)
+    /// Display name for `layout` (falls back to the layout name itself).
+    pub fn layout_message<'a>(&'a self, layout: &'a str) -> &'a str {
+        self.messages.get(layout).map(String::as_str).unwrap_or(layout)
     }
 
-    /// Index of `layout` in the configured rotation, or `None`.
+    /// Index of `layout` in `keyboard.layouts`, used by `hyprctl switchxkblayout`.
     pub fn layout_index(&self, layout: &str) -> Option<usize> {
         self.keyboard.layouts.iter().position(|l| l == layout)
     }
 
-    /// True if the window class should force the first layout.
-    pub fn is_english_class(&self, cls: &str) -> bool {
-        self.auto_switch.english_apps.iter().any(|a| a == cls)
+    pub fn layout_for_class(&self, class: &str) -> Option<&str> {
+        self.force_layout.layout_for_class(class)
     }
 
-    /// True if the layer surface name requires the first layout.
-    pub fn is_english_layer(&self, name: &str) -> bool {
-        if self.auto_switch.english_layers.iter().any(|l| l == name) {
-            return true;
-        }
-        let sub = &self.auto_switch.english_layer_contains;
-        !sub.is_empty() && name.contains(sub.as_str())
+    pub fn layout_for_layer(&self, layer: &str) -> Option<&str> {
+        self.force_layout.layout_for_layer(layer)
     }
 
-    /// Write a skeleton config to `path` **only if the file does not exist**.
+    pub fn default_path() -> Option<PathBuf> {
+        std::env::var("HOME").ok().map(|home| {
+            PathBuf::from(home).join(".config").join("hyprxkb").join("config.toml")
+        })
+    }
+
+    /// Write the default config skeleton if the file does not yet exist.
     pub fn write_default(path: &Path) {
-        if path.exists() {
-            return;
-        }
+        if path.exists() { return; }
         if let Some(dir) = path.parent() {
             if let Err(e) = fs::create_dir_all(dir) {
-                eprintln!("[config] mkdir {:?}: {}", dir, e);
+                eprintln!("[config] mkdir {dir:?}: {e}");
                 return;
             }
         }
-        let content = r#"# hyprxkb configuration
-# Full reference: https://github.com/blackcityskyline/hyprxkb
+        if let Err(e) = fs::write(path, DEFAULT_CONFIG) {
+            eprintln!("[config] write {path:?}: {e}");
+        } else {
+            eprintln!("[config] created default: {path:?}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Default config file template
+// ---------------------------------------------------------------------------
+
+const DEFAULT_CONFIG: &str = r#"# hyprxkb configuration — ~/.config/hyprxkb/config.toml
 
 [keyboard]
-device  = "keyd-virtual-keyboard"
-# Layout rotation order when using the hotkey.
-layouts = ["en", "ru"]
+device  = "keyd-virtual-keyboard"   # see: hyprctl devices
+layouts = ["en", "ru"]              # rotation order
 
 [hotkey]
-# Modifier: Meta (Super/Win), Alt, Ctrl, Shift
-modifier = "Meta"
-# Key: Space, Tab, F1..F12, Grave, Minus, Equal, Left, Right, Up, Down
-key = "Space"
+modifier = "Meta"   # Meta | Alt | Ctrl | Shift
+key      = "Space"  # Space | Tab | F1..F12 | Grave | Minus | ...
 
-[osd]
-enabled = true
-icon    = "input-keyboard-symbolic"
-
-[osd.messages]
+# Human-readable names shown in notifications.
+[messages]
 en = "🇺🇸 US English"
 ru = "🇷🇺 Russian"
 
-[auto_switch]
-# Window classes that force the first layout.
-english_apps = [
-    "nvim", "vim", "btop", "htop",
-    "alacritty", "foot", "kitty", "mpv", "pcmanfm",
-]
-# Layer surfaces by exact name.
-english_layers = ["rofi", "wofi"]
-# Layer surfaces whose name *contains* this substring.
-english_layer_contains = "launcher"
+# Notification backend.
+# backend: none | swayosd | notify-send
+[notify]
+backend    = "none"
+timeout_ms = 2000
+icon       = "input-keyboard-symbolic"
+
+# CapsLock state monitoring (reads /sys/class/leds/).
+[capslock]
+enabled = true
+poll_ms = 150
+
+# Force a specific layout when certain apps or layer surfaces are active.
+# Multiple rules are evaluated in order; first match wins.
+[[force_layout.rules]]
+layout         = "en"
+apps           = ["nvim", "vim", "btop", "htop", "alacritty", "foot", "kitty", "mpv", "pcmanfm"]
+layers         = ["rofi", "wofi"]
+layer_contains = "launcher"
+
+# Example: force Russian for messaging apps
+# [[force_layout.rules]]
+# layout = "ru"
+# apps   = ["telegram-desktop", "discord"]
 
 [general]
-layout_file    = "/tmp/hypr-layout"
+layout_file     = "/tmp/hypr-layout"
 switch_delay_ms = 150
 "#;
-        match fs::write(path, content) {
-            Ok(()) => eprintln!("[config] created default: {:?}", path),
-            Err(e) => eprintln!("[config] write {:?}: {}", path, e),
-        }
-    }
-
-    /// Resolve the config path from $HOME.
-    pub fn default_path() -> Option<PathBuf> {
-        std::env::var("HOME").ok().map(|h| {
-            PathBuf::from(h)
-                .join(".config")
-                .join("hyprxkb")
-                .join("config.toml")
-        })
-    }
-}

@@ -5,7 +5,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/hyprxkb
+ExecStart=%h/.local/bin/hyprkbtool
 Restart=on-failure
 RestartSec=3
 

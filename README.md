@@ -85,71 +85,6 @@ hyprxkb list         # list all configured layouts
 Default path: `~/.config/hyprxkb/config.toml`  
 Run `hyprxkb init` to generate it.
 
-```toml
-# ── Keyboard ──────────────────────────────────────────────────────────────────
-[keyboard]
-# Device name as shown by `hyprctl devices`.
-# "all" switches every keyboard Hyprland knows about simultaneously —
-# useful when keyd or other virtual keyboards are present alongside the physical one.
-device  = "all"
-
-# Layout rotation order — XKB identifiers (us, ru, de, gb, fr, …).
-layouts = ["us", "ru"]
-
-# ── Hotkey ────────────────────────────────────────────────────────────────────
-[hotkey]
-modifier = "Super"   # Super | Alt | Ctrl | Shift
-key      = "Space"   # Space | Tab | Grave | Minus | Equal | F1–F12 | …
-
-# ── Labels ────────────────────────────────────────────────────────────────────
-# Human-readable names shown in notifications and `hyprxkb status`.
-# Keys must match XKB identifiers in keyboard.layouts.
-[labels]
-us = "🇺🇸 English"
-ru = "🇷🇺 Russian"
-
-# ── Notifications ─────────────────────────────────────────────────────────────
-[notify]
-# backend: none | swayosd | notify-send | quickshell
-backend    = "none"
-timeout_ms = 2000
-icon       = "input-keyboard-symbolic"
-
-# Instantly refresh waybar after every layout switch.
-# Must match the "signal" field in your waybar module config.
-# waybar_signal = 8
-
-# QuickShell IPC socket (only used when backend = "quickshell").
-# Defaults to $XDG_RUNTIME_DIR/quickshell.sock
-# quickshell_socket = "/run/user/1000/quickshell.sock"
-
-# ── CapsLock ──────────────────────────────────────────────────────────────────
-[capslock]
-enabled = true
-poll_ms = 150
-
-# ── General ───────────────────────────────────────────────────────────────────
-[general]
-state_file        = "/tmp/hyprxkb-state"
-switch_delay_ms   = 100    # debounce for window-focus events; does not affect hotkey
-per_window_memory = false  # remember last layout per app (like Windows/macOS IME)
-sync_interval_ms  = 5000   # how often to sync state from compositor (ms)
-
-# ── Force-layout rules ────────────────────────────────────────────────────────
-# Evaluated top-to-bottom; first match wins.
-# App patterns: case-insensitive, supports * (any sequence) and ? (one char).
-[[force_layout.rules]]
-layout = "us"
-apps   = [
-    "org.alacritty", "foot", "kitty", "org.wezfurlong.wezterm",
-    "nvim", "vim", "btop", "htop", "mpv", "pcmanfm",
-]
-layers         = ["rofi", "wofi"]
-layer_contains = ["launcher", "runner"]
-
-# [[force_layout.rules]]
-# layout = "ru"
-# apps   = ["org.telegram.desktop", "discord", "org.telegram.*"]
 ```
 
 ## Waybar integration
@@ -164,6 +99,7 @@ layer_contains = ["launcher", "runner"]
 ```
 
 **Option B — JSON with instant updates (recommended):**
+
 ```json
 "custom/layout": {
     "exec": "hyprxkb status --json",

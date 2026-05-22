@@ -8,8 +8,11 @@ Keyboard layout-switching daemon for [Hyprland](https://hyprland.org/).
 - **Restore** — return to the previous layout when leaving a forced context
 - **Hotkey** — cycle layouts with a configurable `modifier+key` (works on the lock screen via raw `/dev/input`)
 - **Notifications** — optional OSD via `swayosd` or any `notify-send` compatible daemon
-- **CapsLock monitor** — send a notification on CapsLock state change
-- **CLI** — `reload`, `status`, `switch <layout>` subcommands
+- **CapsLock monitor** — notification on CapsLock state change
+- **Per-window memory** — remember the last layout per app and restore it on focus
+- **Waybar integration** — instant bar update via configurable SIGRTMIN signal
+- **Glob matching** — `*` and `?` wildcards in app class patterns
+- **CLI** — `reload`, `status [--json]`, `switch <layout>`, `list`
 
 ## Build
 
@@ -24,7 +27,7 @@ cargo build --release
 |---|---|---|
 | `hyprctl` | yes | Bundled with Hyprland |
 | `swayosd-client` | no | OSD overlays |
-| `notify-send` | no | For dunst / mako / swaync |
+| `notify-send` | no | dunst / mako / swaync |
 
 **`/dev/input` access** is needed for the lock-screen hotkey.
 Add yourself to the `input` group, or drop a udev rule:
@@ -39,8 +42,10 @@ KERNEL=="event*", GROUP="input", MODE="0660"
 ```bash
 hyprxkb                  # start daemon
 hyprxkb reload           # reload config (sends SIGUSR1)
-hyprxkb status           # print current layout name
+hyprxkb status           # print current layout (plain text)
+hyprxkb status --json    # print as JSON — for waybar return-type: json
 hyprxkb switch ru        # switch to a specific layout
+hyprxkb list             # list all configured layouts with display names
 ```
 
 ## Configuration
@@ -63,39 +68,33 @@ ru = "🇷🇺 Russian"
 
 # Notification backend: none | swayosd | notify-send
 [notify]
-backend    = "none"
-timeout_ms = 2000
-icon       = "input-keyboard-symbolic"
+backend       = "none"
+timeout_ms    = 2000
+icon          = "input-keyboard-symbolic"
+waybar_signal = 8   # optional: pkill -SIGRTMIN+8 waybar after each switch
 
 # CapsLock state monitoring.
 [capslock]
 enabled = true
 poll_ms = 150
 
-# Force a layout when certain apps or layers are active.
-# Multiple rules are evaluated in order — first match wins.
+# Force rules — app patterns support * and ? wildcards.
+# Multiple rules evaluated in order; first match wins.
 [[force_layout.rules]]
 layout         = "en"
-apps           = ["nvim", "vim", "btop", "htop", "alacritty", "foot", "kitty"]
+apps           = ["nvim", "vim", "*top", "alacritty", "foot", "kitty", "mpv"]
 layers         = ["rofi", "wofi"]
 layer_contains = "launcher"
 
 [general]
-layout_file     = "/tmp/hypr-layout"
-switch_delay_ms = 150
-```
-
-## Hyprland autostart
-
-```ini
-# ~/.config/hypr/hyprland.conf
-exec-once = hyprxkb
+layout_file       = "/tmp/hypr-layout"
+switch_delay_ms   = 150
+per_window_memory = false   # remember last layout per app (like Windows/macOS IME)
 ```
 
 ## Waybar integration
 
-Use `hyprxkb status` as a custom module:
-
+**Option A — plain text, polling:**
 ```json
 "custom/layout": {
     "exec": "hyprxkb status",
@@ -104,12 +103,20 @@ Use `hyprxkb status` as a custom module:
 }
 ```
 
----
+**Option B — JSON with instant updates (recommended):**
+```json
+"custom/layout": {
+    "exec": "hyprxkb status --json",
+    "return-type": "json",
+    "interval": "once",
+    "signal": 8
+}
+```
+Then set `waybar_signal = 8` in `[notify]`. The bar refreshes the moment the layout changes.
 
-## Ideas / Roadmap
+## Hyprland autostart
 
-- **Per-window layout memory** — remember the last layout for each app class and restore it on focus (like Windows/macOS IME behaviour)
-- **Waybar signal** — send `pkill -SIGRTMIN+8 waybar` after every switch so the bar updates instantly
-- **Glob/regex app matching** — `apps = ["*term*", "org.gnome.*"]` in force rules
-- **`hyprxkb status --json`** — structured output for waybar `return-type: json` (layout, capslock, icon, tooltip)
-- **Multi-device hotkeys** — separate hotkey per keyboard (e.g. laptop vs external)
+```ini
+# ~/.config/hypr/hyprland.conf
+exec-once = hyprxkb
+```

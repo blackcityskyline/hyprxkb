@@ -1,57 +1,50 @@
-//! Notification backends.
+//! Notification system.
+//!
+//! Adding a new backend = implement `NotifyBackend` in a new submodule,
+//! then add a variant to `create_backend()`.
 
-use crate::config::{NotifyBackend, NotifyConfig};
-use std::process::Command;
+pub mod none;
+pub mod swayosd;
+pub mod notify_send;
+pub mod quickshell;
 
-/// Send a generic layout-switch notification.
-pub fn send(cfg: &NotifyConfig, summary: &str, body: &str) {
+use crate::config::{NotifyBackend as BackendKind, NotifyConfig};
+
+// ---------------------------------------------------------------------------
+// Trait
+// ---------------------------------------------------------------------------
+
+/// A notification backend.
+pub trait NotifyBackend: Send + Sync {
+    /// Send a layout-change notification.
+    fn layout_changed(&self, label: &str);
+    /// Send a CapsLock state notification.
+    fn capslock_changed(&self, enabled: bool);
+}
+
+// ---------------------------------------------------------------------------
+// Factory
+// ---------------------------------------------------------------------------
+
+pub fn create_backend(cfg: &NotifyConfig) -> Box<dyn NotifyBackend> {
     match cfg.backend {
-        NotifyBackend::None => {}
-
-        NotifyBackend::SwayOsd => {
-            Command::new("swayosd-client")
-                .args(["--custom-message", summary, "--custom-icon", &cfg.icon])
-                .spawn()
-                .ok();
-        }
-
-        NotifyBackend::NotifySend => {
-            Command::new("notify-send")
-                .args([
-                    "--icon",        &cfg.icon,
-                    "--expire-time", &cfg.timeout_ms.to_string(),
-                    "--urgency",     "low",
-                    summary,
-                    body,
-                ])
-                .spawn()
-                .ok();
-        }
+        BackendKind::None        => Box::new(none::NoneBackend),
+        BackendKind::SwayOsd     => Box::new(swayosd::SwayOsdBackend::new(cfg)),
+        BackendKind::NotifySend  => Box::new(notify_send::NotifySendBackend::new(cfg)),
+        BackendKind::QuickShell  => Box::new(quickshell::QuickShellBackend::new(cfg)),
     }
 }
 
-/// Send a CapsLock state notification.
-pub fn send_capslock(cfg: &NotifyConfig, enabled: bool) {
-    match cfg.backend {
-        NotifyBackend::None => {}
+// ---------------------------------------------------------------------------
+// Waybar signal helper (shared by all backends)
+// ---------------------------------------------------------------------------
 
-        NotifyBackend::SwayOsd => {
-            Command::new("swayosd-client").arg("--caps-lock").spawn().ok();
-        }
-
-        NotifyBackend::NotifySend => {
-            let state = if enabled { "On" } else { "Off" };
-            let icon  = if enabled { "caps-lock-symbolic" } else { "caps-lock-off-symbolic" };
-            Command::new("notify-send")
-                .args([
-                    "--icon",        icon,
-                    "--expire-time", &cfg.timeout_ms.to_string(),
-                    "--urgency",     "low",
-                    &format!("Caps Lock {state}"),
-                    "",
-                ])
-                .spawn()
-                .ok();
-        }
-    }
+/// Send SIGRTMIN+N to all `waybar` processes to trigger an instant bar refresh.
+pub fn signal_waybar(sig: u8) {
+    // SIGRTMIN = 34 on Linux.
+    let signum = 34i32 + sig as i32;
+    std::process::Command::new("pkill")
+        .args([&format!("-{signum}"), "waybar"])
+        .spawn()
+        .ok();
 }

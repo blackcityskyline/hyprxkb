@@ -1,8 +1,8 @@
 [package]
 name        = "hyprxkb"
-version     = "0.3.0"
+version     = "0.4.0"
 edition     = "2021"
-description = "Keyboard layout-switching daemon for Hyprland"
+description = "Keyboard layout-switching utility for Hyprland"
 license     = "MIT"
 
 [[bin]]
@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 toml        = "1.0"
 serde       = { version = "1.0", features = ["derive"] }
+serde_json  = "1.0"
 evdev       = "0.13"
 signal-hook = "0.3"
 libc        = "0.2"

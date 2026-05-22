@@ -1,210 +1,69 @@
-//! Configuration: loading, defaults, writing the skeleton config file.
+//! Configuration: loading, defaults, writing the skeleton config, glob matching.
 
-use serde::Deserialize;
-use std::{
-    collections::HashMap,
-    fs,
-    path::{Path, PathBuf},
-};
+pub mod schema;
+pub use schema::*;
+
+use std::{fs, path::{Path, PathBuf}};
 
 // ---------------------------------------------------------------------------
-// Notify
+// Glob matching
 // ---------------------------------------------------------------------------
 
-/// Supported notification backends.
+/// Simple `*` / `?` glob match.
 ///
-/// `Dunst`, `Mako`, `SwayNc`, and `NotifySend` all call `notify-send` under
-/// the hood — they exist as separate variants only for documentation purposes
-/// and possible future divergence.
-#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum NotifyBackend {
-    /// Notifications disabled.
-    #[default]
-    None,
-    /// `swayosd-client` — shows OSD overlays.
-    SwayOsd,
-    /// `notify-send` compatible daemons (dunst, mako, swaync, libnotify).
-    NotifySend,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct NotifyConfig {
-    pub backend:    NotifyBackend,
-    pub timeout_ms: u64,
-    pub icon:       String,
-}
-
-impl Default for NotifyConfig {
-    fn default() -> Self {
-        Self {
-            backend:    NotifyBackend::None,
-            timeout_ms: 2000,
-            icon:       "input-keyboard-symbolic".into(),
+/// - `*` — matches any sequence of characters (including empty).
+/// - `?` — matches exactly one character.
+/// - Matching is case-insensitive (both sides are expected to be lowercased by caller).
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let (p, t) = (pattern.as_bytes(), text.as_bytes());
+    let (m, n) = (p.len(), t.len());
+    let mut dp = vec![vec![false; n + 1]; m + 1];
+    dp[0][0] = true;
+    for i in 1..=m {
+        if p[i - 1] == b'*' { dp[i][0] = dp[i - 1][0]; } else { break; }
+    }
+    for i in 1..=m {
+        for j in 1..=n {
+            dp[i][j] = match p[i - 1] {
+                b'*' => dp[i - 1][j] || dp[i][j - 1],
+                b'?' => dp[i - 1][j - 1],
+                c    => dp[i - 1][j - 1] && c == t[j - 1],
+            };
         }
     }
+    dp[m][n]
 }
 
 // ---------------------------------------------------------------------------
-// CapsLock
+// Rule matching
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct CapsLockConfig {
-    pub enabled: bool,
-    pub poll_ms: u64,
-}
-
-impl Default for CapsLockConfig {
-    fn default() -> Self {
-        Self { enabled: true, poll_ms: 150 }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Keyboard
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct KeyboardConfig {
-    /// The hyprctl device name (see `hyprctl devices`).
-    pub device:  String,
-    /// Layout rotation order — names must match XKB layout names.
-    pub layouts: Vec<String>,
-}
-
-impl Default for KeyboardConfig {
-    fn default() -> Self {
-        Self {
-            device:  "keyd-virtual-keyboard".into(),
-            layouts: vec!["en".into(), "ru".into()],
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Hotkey
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct HotkeyConfig {
-    /// `Meta` | `Alt` | `Ctrl` | `Shift`
-    pub modifier: String,
-    /// `Space` | `Tab` | `F1`–`F12` | `Grave` | `Minus` | …
-    pub key: String,
-}
-
-impl Default for HotkeyConfig {
-    fn default() -> Self {
-        Self { modifier: "Meta".into(), key: "Space".into() }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Force-layout rules
-// ---------------------------------------------------------------------------
-
-/// A single rule that forces a layout for specific apps or layer surfaces.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ForceRule {
-    /// Target layout name (must be in `keyboard.layouts`).
-    pub layout: String,
-    /// Exact window class names (lowercased) that trigger this rule.
-    #[serde(default)]
-    pub apps: Vec<String>,
-    /// Exact layer surface names that trigger this rule.
-    #[serde(default)]
-    pub layers: Vec<String>,
-    /// Substring match for layer surface names.
-    #[serde(default)]
-    pub layer_contains: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct ForceLayoutConfig {
-    pub rules: Vec<ForceRule>,
-}
-
-impl Default for ForceLayoutConfig {
-    fn default() -> Self {
-        Self {
-            rules: vec![ForceRule {
-                layout: "en".into(),
-                apps: vec![
-                    "nvim".into(), "vim".into(), "btop".into(), "htop".into(),
-                    "alacritty".into(), "foot".into(), "kitty".into(),
-                    "mpv".into(), "pcmanfm".into(),
-                ],
-                layers:         vec!["rofi".into(), "wofi".into()],
-                layer_contains: "launcher".into(),
-            }],
-        }
-    }
-}
 
 impl ForceLayoutConfig {
+    /// Return the forced layout for a window class, or `None`.
     pub fn layout_for_class(&self, class: &str) -> Option<&str> {
+        let lower = class.to_ascii_lowercase();
         self.rules.iter()
-            .find(|r| r.apps.iter().any(|a| a == class))
+            .find(|r| r.apps.iter().any(|pat| glob_match(pat, &lower)))
             .map(|r| r.layout.as_str())
     }
 
+    /// Return the forced layout for a layer surface name, or `None`.
     pub fn layout_for_layer(&self, layer: &str) -> Option<&str> {
+        let lower = layer.to_ascii_lowercase();
         self.rules.iter()
             .find(|r| {
-                r.layers.iter().any(|l| l == layer)
-                    || (!r.layer_contains.is_empty() && layer.contains(&r.layer_contains))
+                r.layers.iter().any(|l| l.to_ascii_lowercase() == lower)
+                    || r.layer_contains.iter().any(|sub| lower.contains(sub.as_str()))
             })
             .map(|r| r.layout.as_str())
     }
 }
 
 // ---------------------------------------------------------------------------
-// General
+// Load / write
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct GeneralConfig {
-    /// File used to persist the current layout across restarts.
-    pub layout_file:     String,
-    /// Minimum time between layout switches (debounce for Hyprland events).
-    pub switch_delay_ms: u64,
-}
-
-impl Default for GeneralConfig {
-    fn default() -> Self {
-        Self { layout_file: "/tmp/hypr-layout".into(), switch_delay_ms: 150 }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Root config
-// ---------------------------------------------------------------------------
-
-/// Human-readable display names for each layout (used in notifications).
-/// Key: layout name (e.g. "en"), value: display string (e.g. "🇺🇸 English").
-pub type LayoutMessages = HashMap<String, String>;
-
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
-pub struct Config {
-    pub keyboard:     KeyboardConfig,
-    pub hotkey:       HotkeyConfig,
-    pub notify:       NotifyConfig,
-    pub capslock:     CapsLockConfig,
-    pub force_layout: ForceLayoutConfig,
-    pub general:      GeneralConfig,
-    pub messages:     LayoutMessages,
-}
 
 impl Config {
-    /// Load config from `path`, falling back to defaults on any error.
     pub fn load(path: &Path) -> Self {
         let text = match fs::read_to_string(path) {
             Ok(t)  => t,
@@ -213,33 +72,22 @@ impl Config {
                 return Self::default();
             }
         };
-        match toml::from_str(&text) {
-            Ok(cfg) => { eprintln!("[config] loaded: {path:?}"); cfg }
-            Err(e)  => {
+        match toml::from_str::<Self>(&text) {
+            Ok(cfg) => {
+                eprintln!("[config] loaded {path:?}");
+                for w in cfg.warnings() {
+                    eprintln!("[config] WARNING: {w}");
+                }
+                cfg
+            }
+            Err(e) => {
                 eprintln!("[config] parse error in {path:?}: {e} — using defaults");
                 Self::default()
             }
         }
     }
 
-    /// Display name for `layout` (falls back to the layout name itself).
-    pub fn layout_message<'a>(&'a self, layout: &'a str) -> &'a str {
-        self.messages.get(layout).map(String::as_str).unwrap_or(layout)
-    }
-
-    /// Index of `layout` in `keyboard.layouts`, used by `hyprctl switchxkblayout`.
-    pub fn layout_index(&self, layout: &str) -> Option<usize> {
-        self.keyboard.layouts.iter().position(|l| l == layout)
-    }
-
-    pub fn layout_for_class(&self, class: &str) -> Option<&str> {
-        self.force_layout.layout_for_class(class)
-    }
-
-    pub fn layout_for_layer(&self, layer: &str) -> Option<&str> {
-        self.force_layout.layout_for_layer(layer)
-    }
-
+    /// Default config file path: `~/.config/hyprxkb/config.toml`.
     pub fn default_path() -> Option<PathBuf> {
         std::env::var("HOME").ok().map(|home| {
             PathBuf::from(home).join(".config").join("hyprxkb").join("config.toml")
@@ -247,67 +95,121 @@ impl Config {
     }
 
     /// Write the default config skeleton if the file does not yet exist.
-    pub fn write_default(path: &Path) {
-        if path.exists() { return; }
+    /// Returns `true` if a new file was created.
+    pub fn write_default(path: &Path) -> bool {
+        if path.exists() {
+            return false;
+        }
         if let Some(dir) = path.parent() {
             if let Err(e) = fs::create_dir_all(dir) {
-                eprintln!("[config] mkdir {dir:?}: {e}");
-                return;
+                eprintln!("[config] cannot create {dir:?}: {e}");
+                return false;
             }
         }
-        if let Err(e) = fs::write(path, DEFAULT_CONFIG) {
-            eprintln!("[config] write {path:?}: {e}");
-        } else {
-            eprintln!("[config] created default: {path:?}");
+        match fs::write(path, DEFAULT_CONFIG_TEMPLATE) {
+            Ok(()) => {
+                eprintln!("[config] created default config at {path:?}");
+                true
+            }
+            Err(e) => {
+                eprintln!("[config] cannot write {path:?}: {e}");
+                false
+            }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Default config file template
+// Default config template
 // ---------------------------------------------------------------------------
 
-const DEFAULT_CONFIG: &str = r#"# hyprxkb configuration — ~/.config/hyprxkb/config.toml
+const DEFAULT_CONFIG_TEMPLATE: &str = r#"# hyprxkb — keyboard layout switcher for Hyprland
+# ~/.config/hyprxkb/config.toml
+#
+# Run `hyprxkb init` to (re)create this file.
+# Run `hyprctl devices` to find your keyboard device name.
 
+# ── Keyboard ──────────────────────────────────────────────────────────────────
 [keyboard]
-device  = "keyd-virtual-keyboard"   # see: hyprctl devices
-layouts = ["en", "ru"]              # rotation order
+# Device name as shown by `hyprctl devices` (case-sensitive).
+# Use "all" to switch every keyboard Hyprland knows about simultaneously —
+# useful when you have keyd or other virtual keyboards alongside the physical one.
+device  = "all"
 
+# Layout rotation order — use XKB identifiers (us, ru, de, gb, fr, …).
+# `hyprxkb switch` and hotkey cycle through these in order.
+layouts = ["us", "ru"]
+
+# ── Hotkey ────────────────────────────────────────────────────────────────────
 [hotkey]
-modifier = "Meta"   # Meta | Alt | Ctrl | Shift
-key      = "Space"  # Space | Tab | F1..F12 | Grave | Minus | ...
+# Modifier: Super | Alt | Ctrl | Shift
+modifier = "Super"
+# Key:      Space | Tab | Grave | Minus | Equal | F1–F12 | Left | Right | …
+key      = "Space"
 
-# Human-readable names shown in notifications.
-[messages]
-en = "🇺🇸 US English"
+# ── Labels ────────────────────────────────────────────────────────────────────
+# Human-readable names shown in notifications and `hyprxkb status`.
+# Keys must be XKB layout identifiers matching keyboard.layouts above.
+[labels]
+us = "🇺🇸 English"
 ru = "🇷🇺 Russian"
 
-# Notification backend.
-# backend: none | swayosd | notify-send
+# ── Notifications ─────────────────────────────────────────────────────────────
 [notify]
+# backend: none | swayosd | notify-send | quickshell
 backend    = "none"
 timeout_ms = 2000
 icon       = "input-keyboard-symbolic"
 
-# CapsLock state monitoring (reads /sys/class/leds/).
+# Instantly refresh waybar after every layout switch.
+# Set the signal number matching your waybar module's "signal" field.
+# waybar_signal = 8
+
+# QuickShell IPC socket (only used when backend = "quickshell").
+# Defaults to $XDG_RUNTIME_DIR/quickshell.sock
+# quickshell_socket = "/run/user/1000/quickshell.sock"
+
+# ── CapsLock ──────────────────────────────────────────────────────────────────
 [capslock]
+# Monitor /sys/class/leds/ and send a notification on CapsLock state change.
 enabled = true
 poll_ms = 150
 
-# Force a specific layout when certain apps or layer surfaces are active.
-# Multiple rules are evaluated in order; first match wins.
+# ── General ───────────────────────────────────────────────────────────────────
+[general]
+# File used to persist the active layout across restarts.
+state_file = "/tmp/hyprxkb-state"
+
+# Minimum delay (ms) between automatic switches triggered by window focus.
+# Prevents flickering when focus changes rapidly. Does not affect hotkey.
+switch_delay_ms = 100
+
+# Remember the last layout per app and restore it on focus (like Windows IME).
+per_window_memory = false
+
+# How often (ms) to re-read the real compositor layout and sync our state.
+# Keeps us correct when another tool changes the layout externally.
+sync_interval_ms = 5000
+
+# ── Force-layout rules ────────────────────────────────────────────────────────
+# Force a specific layout when matching windows or layer surfaces are active.
+# Rules are evaluated top-to-bottom; the first match wins.
+# App patterns support * (any sequence) and ? (any single char) wildcards.
+# Matching is case-insensitive.
+
 [[force_layout.rules]]
-layout         = "en"
-apps           = ["nvim", "vim", "btop", "htop", "alacritty", "foot", "kitty", "mpv", "pcmanfm"]
+layout = "us"
+# Terminal emulators and TUI apps — always English
+apps = [
+    "org.alacritty", "foot", "kitty", "org.wezfurlong.wezterm",
+    "nvim", "vim", "btop", "htop", "mpv", "pcmanfm",
+]
+# Launcher layer surfaces
 layers         = ["rofi", "wofi"]
-layer_contains = "launcher"
+layer_contains = ["launcher", "runner"]
 
 # Example: force Russian for messaging apps
 # [[force_layout.rules]]
 # layout = "ru"
-# apps   = ["telegram-desktop", "discord"]
-
-[general]
-layout_file     = "/tmp/hypr-layout"
-switch_delay_ms = 150
+# apps   = ["org.telegram.desktop", "discord", "org.telegram.*"]
 "#;

@@ -1,93 +1,134 @@
-//! Layout state: reading/writing the state file, applying layouts via hyprctl.
+//! Layout state machine.
+//!
+//! `Engine` is a pure state machine: it receives `EngineInput` values and
+//! returns `Vec<Action>`. All I/O (hyprctl, file writes, notifications) is
+//! performed by the caller (`Runner` in `main.rs`).
+//!
+//! # State invariants
+//! - `current` — the layout we last *told the compositor* to apply.
+//!   May diverge from reality if an external tool changed it; re-synced via
+//!   `EngineInput::ExternalSync`.
+//! - `forced_stack` — stack of `(source_id, layout)` pairs. `source_id` is an
+//!   opaque string (layer name or window class) so we can pop the exact frame
+//!   that was pushed, even if multiple force contexts are nested.
+//! - `saved` — the "free" layout to restore once the forced stack drains.
+//! - `memory` — per-window layout memory map (app_class → layout).
 
-use crate::{config::Config, notify};
-use std::{fs, process::Command};
+pub mod rules;
+
+use crate::config::Config;
+use rules::RuleMatch;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
-// File helpers
+// Public input / output types
 // ---------------------------------------------------------------------------
 
-/// Read the persisted layout from disk. Falls back to the first configured layout.
-pub fn file_read(cfg: &Config) -> String {
-    if let Ok(s) = fs::read_to_string(&cfg.general.layout_file) {
-        let s = s.trim().to_owned();
-        if !s.is_empty() && cfg.layout_index(&s).is_some() {
-            return s;
-        }
-    }
-    let fallback = cfg.keyboard.layouts.first().cloned().unwrap_or_default();
-    file_write(cfg, &fallback);
-    fallback
+/// Input to the engine. One value per compositor/hotkey/sync event.
+#[derive(Debug, Clone)]
+pub enum EngineInput {
+    /// A window received focus.
+    WindowFocus { class: String },
+    /// A layer surface was opened.
+    LayerOpen { name: String },
+    /// A layer surface was closed.
+    LayerClose { name: String },
+    /// User pressed the hotkey — rotate to the next layout.
+    Hotkey,
+    /// Explicit switch to a named layout (CLI `switch` command).
+    #[allow(dead_code)]
+    SwitchTo { layout: String },
+    /// Periodic sync: the compositor's real active layout (may differ from ours).
+    ExternalSync { layout: String },
 }
 
-/// Persist the current layout name to disk.
-pub fn file_write(cfg: &Config, layout: &str) {
-    if let Err(e) = fs::write(&cfg.general.layout_file, layout) {
-        eprintln!("[layout] write state file: {e}");
-    }
+/// Actions the runner must perform after processing an input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Tell the compositor to activate this layout index.
+    ApplyLayout {
+        /// XKB layout name (e.g. "us", "ru").
+        layout: String,
+        /// Pre-resolved index into `keyboard.layouts`.
+        index: usize,
+    },
+    /// Persist the layout name to the state file.
+    PersistLayout { layout: String },
+    /// Send a layout-change notification.
+    Notify { layout: String },
 }
 
 // ---------------------------------------------------------------------------
-// hyprctl
+// Engine
 // ---------------------------------------------------------------------------
 
-fn hyprctl_set(device: &str, idx: usize) {
-    match Command::new("hyprctl")
-        .args(["switchxkblayout", device, &idx.to_string()])
-        .status()
-    {
-        Ok(s) if !s.success() => eprintln!("[layout] hyprctl exited with {s}"),
-        Err(e)                => eprintln!("[layout] hyprctl: {e}"),
-        _                     => {}
-    }
-}
-
-// ---------------------------------------------------------------------------
-// State machine
-// ---------------------------------------------------------------------------
-
-/// Layout state machine.
-///
-/// # Invariants
-/// - `current` always reflects the layout that was last applied.
-/// - `forced_stack` is non-empty only when a forced context is active.
-/// - `saved_layout` holds the layout to restore once all forced contexts exit.
 #[derive(Debug, Default)]
-pub struct State {
-    /// The layout currently active (mirrors the state file).
-    current:      Option<String>,
-    /// Stack of forced layouts (e.g. rofi opened inside a terminal).
-    forced_stack: Vec<String>,
-    /// Layout to restore when `forced_stack` drains.
-    saved_layout: Option<String>,
+pub struct Engine {
+    /// Last layout we issued an ApplyLayout for.
+    current: Option<String>,
+    /// Stack of (source_id, forced_layout).
+    forced_stack: Vec<(String, String)>,
+    /// Layout to restore when forced_stack drains.
+    saved: Option<String>,
+    /// Per-window memory: class → layout.
+    memory: HashMap<String, String>,
+    /// Class of the currently focused window (for memory recording).
+    focused_class: Option<String>,
 }
 
-impl State {
+impl Engine {
     // ------------------------------------------------------------------
     // Internal helpers
     // ------------------------------------------------------------------
 
-    /// Apply `layout` via hyprctl and update all local state, but only if it
-    /// differs from the currently active layout (avoids redundant syscalls).
-    fn apply(&mut self, cfg: &Config, layout: &str) {
+    /// Build the ApplyLayout + PersistLayout + Notify action triple,
+    /// but only if `layout` differs from what is already applied.
+    fn make_apply(&self, cfg: &Config, layout: &str) -> Vec<Action> {
         if self.current.as_deref() == Some(layout) {
-            return;
+            return vec![];
         }
-        if let Some(idx) = cfg.layout_index(layout) {
-            eprintln!("[layout] {} → {layout}", self.current.as_deref().unwrap_or("?"));
-            hyprctl_set(&cfg.keyboard.device, idx);
-            file_write(cfg, layout);
-            self.current = Some(layout.to_owned());
-            notify::send(&cfg.notify, cfg.layout_message(layout), "");
-        } else {
-            eprintln!("[layout] unknown layout {layout:?}");
+        let Some(index) = cfg.layout_index(layout) else {
+            eprintln!("[engine] unknown layout {layout:?} — skipping");
+            return vec![];
+        };
+        vec![
+            Action::ApplyLayout { layout: layout.to_owned(), index },
+            Action::PersistLayout { layout: layout.to_owned() },
+            Action::Notify { layout: layout.to_owned() },
+        ]
+    }
+
+    /// Record the current layout for `class` into per-window memory.
+    fn remember(&mut self, class: &str) {
+        if let Some(cur) = self.current.clone() {
+            self.memory.insert(class.to_owned(), cur);
         }
     }
 
-    /// Ensure `current` is populated (loads from file on first call).
-    fn ensure_current(&mut self, cfg: &Config) {
-        if self.current.is_none() {
-            self.current = Some(file_read(cfg));
+    // ------------------------------------------------------------------
+    // Forced context stack
+    // ------------------------------------------------------------------
+
+    fn push_forced(&mut self, cfg: &Config, source: &str, layout: &str) -> Vec<Action> {
+        if self.forced_stack.is_empty() {
+            // Save the current free layout so we can restore it later.
+            self.saved = self.current.clone();
+        }
+        self.forced_stack.push((source.to_owned(), layout.to_owned()));
+        self.make_apply(cfg, layout)
+    }
+
+    fn pop_forced(&mut self, cfg: &Config, source: &str) -> Vec<Action> {
+        // Remove the frame for this specific source (it may not be the top).
+        self.forced_stack.retain(|(id, _)| id != source);
+
+        let restore = self.forced_stack.last()
+            .map(|(_, l)| l.clone())
+            .or_else(|| self.saved.take());
+
+        match restore {
+            Some(layout) => self.make_apply(cfg, &layout),
+            None         => vec![],
         }
     }
 
@@ -95,62 +136,278 @@ impl State {
     // Public API
     // ------------------------------------------------------------------
 
-    /// Push a forced layout (e.g. app/layer switched to English-only context).
-    pub fn force_push(&mut self, cfg: &Config, layout: &str) {
-        self.ensure_current(cfg);
-        if self.forced_stack.is_empty() {
-            self.saved_layout = self.current.clone();
+    /// Initialise the engine from a persisted layout (read from state file).
+    pub fn init(&mut self, layout: String) {
+        self.current = Some(layout);
+    }
+
+    /// Process one input event and return the actions to perform.
+    pub fn process(&mut self, cfg: &Config, input: EngineInput) -> Vec<Action> {
+        match input {
+            // ----------------------------------------------------------
+            EngineInput::WindowFocus { class } => {
+                // Empty class = focus moved to the desktop / no window.
+                // Hyprland sends this on workspace switch or when all windows
+                // are closed. Ignore it entirely — don't touch memory or
+                // the forced stack, don't switch layout.
+                if class.is_empty() {
+                    return vec![];
+                }
+
+                // 1. Record layout for the *departing* window.
+                if cfg.general.per_window_memory {
+                    if let Some(old) = self.focused_class.take() {
+                        if self.forced_stack.is_empty() {
+                            self.remember(&old);
+                        }
+                    }
+                }
+                self.focused_class = Some(class.clone());
+
+                // 2. Pop any forced context that was pushed for a previous
+                //    layer (layers emit LayerClose, but window-focus-based
+                //    forced contexts need to be cleared here).
+                //    We only pop window-class-sourced frames, not layer frames.
+                let was_window_forced = self.forced_stack.iter()
+                    .any(|(id, _)| !id.starts_with("layer:"));
+                if was_window_forced {
+                    self.forced_stack.retain(|(id, _)| id.starts_with("layer:"));
+                    if self.forced_stack.is_empty() {
+                        // If we also cleared all layer frames, restore saved.
+                        // (Rare: window closed without a LayerClose.)
+                    }
+                }
+
+                match rules::match_class(cfg, &class) {
+                    RuleMatch::Forced(layout) => {
+                        self.push_forced(cfg, &format!("window:{class}"), &layout)
+                    }
+                    RuleMatch::Free => {
+                        // Restore saved layout if we were forced before.
+                        let restore = if !self.forced_stack.is_empty() {
+                            None // still in a layer-forced context
+                        } else if cfg.general.per_window_memory {
+                            self.memory.get(&class).cloned()
+                        } else {
+                            self.saved.take()
+                        };
+
+                        match restore {
+                            Some(layout) => self.make_apply(cfg, &layout),
+                            None         => vec![],
+                        }
+                    }
+                }
+            }
+
+            // ----------------------------------------------------------
+            EngineInput::LayerOpen { name } => {
+                match rules::match_layer(cfg, &name) {
+                    RuleMatch::Forced(layout) => {
+                        self.push_forced(cfg, &format!("layer:{name}"), &layout)
+                    }
+                    RuleMatch::Free => vec![],
+                }
+            }
+
+            // ----------------------------------------------------------
+            EngineInput::LayerClose { name } => {
+                self.pop_forced(cfg, &format!("layer:{name}"))
+            }
+
+            // ----------------------------------------------------------
+            EngineInput::Hotkey => {
+                // Hotkey always resets forced context and rotates freely.
+                self.forced_stack.clear();
+                self.saved = None;
+
+                let layouts = &cfg.keyboard.layouts;
+                if layouts.is_empty() {
+                    return vec![];
+                }
+                let cur = self.current.as_deref().unwrap_or("");
+                let next_idx = (cfg.layout_index(cur).unwrap_or(0) + 1) % layouts.len();
+                let next = layouts[next_idx].clone();
+
+                // Update per-window memory for the focused class.
+                if cfg.general.per_window_memory {
+                    if let Some(class) = &self.focused_class.clone() {
+                        self.memory.insert(class.clone(), next.clone());
+                    }
+                }
+
+                self.make_apply(cfg, &next)
+            }
+
+            // ----------------------------------------------------------
+            EngineInput::SwitchTo { layout } => {
+                self.forced_stack.clear();
+                self.saved = None;
+                self.make_apply(cfg, &layout)
+            }
+
+            // ----------------------------------------------------------
+            EngineInput::ExternalSync { layout } => {
+                // Another process changed the layout. Update our state so
+                // future transitions are computed from the correct baseline.
+                if self.current.as_deref() != Some(&layout) {
+                    eprintln!(
+                        "[engine] external sync: {:?} → {:?}",
+                        self.current.as_deref().unwrap_or("?"),
+                        layout
+                    );
+                    self.current = Some(layout.clone());
+                    // Also update saved/memory if we are in a free context.
+                    if self.forced_stack.is_empty() {
+                        if let Some(class) = &self.focused_class.clone() {
+                            if cfg.general.per_window_memory {
+                                self.memory.insert(class.clone(), layout.clone());
+                            }
+                        }
+                    }
+                    // Persist the synced layout.
+                    return vec![Action::PersistLayout { layout }];
+                }
+                vec![]
+            }
         }
-        self.forced_stack.push(layout.to_owned());
-        self.apply(cfg, layout);
     }
 
-    /// Pop the topmost forced layout and restore the previous one.
-    pub fn force_pop(&mut self, cfg: &Config) {
-        if self.forced_stack.is_empty() {
-            eprintln!("[layout] force_pop called with empty stack — ignoring");
-            return;
-        }
-        self.forced_stack.pop();
-        let next = self.forced_stack.last().cloned()
-            .or_else(|| self.saved_layout.take());
-        if let Some(layout) = next {
-            self.apply(cfg, &layout);
+    /// Apply the action list to `self.current` and `self.saved` fields,
+    /// so our internal state stays consistent.
+    ///
+    /// This must be called *after* the runner successfully applies the actions.
+    pub fn commit(&mut self, actions: &[Action]) {
+        for a in actions {
+            if let Action::ApplyLayout { layout, .. } = a {
+                self.current = Some(layout.clone());
+            }
         }
     }
+}
 
-    /// Whether a forced context is currently active.
-    pub fn is_forced(&self) -> bool {
-        !self.forced_stack.is_empty()
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        Config, ForceLayoutConfig, ForceRule, GeneralConfig, KeyboardConfig,
+    };
+
+    fn cfg_with_rules(rules: Vec<ForceRule>) -> Config {
+        Config {
+            keyboard: KeyboardConfig {
+                device:  "kbd".into(),
+                layouts: vec!["us".into(), "ru".into()],
+            },
+            force_layout: ForceLayoutConfig { rules },
+            general: GeneralConfig {
+                per_window_memory: false,
+                switch_delay_ms:   0,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
-    /// Rotate to the next layout in the configured list (global hotkey action).
-    pub fn rotate(&mut self, cfg: &Config) {
-        self.ensure_current(cfg);
-        self.forced_stack.clear();
-        self.saved_layout = None;
-
-        let layouts = &cfg.keyboard.layouts;
-        if layouts.is_empty() { return; }
-
-        let cur = self.current.as_deref().unwrap_or("");
-        let cur_idx = cfg.layout_index(cur).unwrap_or(0);
-        let next_idx = (cur_idx + 1) % layouts.len();
-        let next = layouts[next_idx].clone();
-        eprintln!("[layout] rotate: {cur} → {next}");
-        self.apply(cfg, &next);
+    fn base_cfg() -> Config {
+        cfg_with_rules(vec![ForceRule {
+            layout:         "us".into(),
+            apps:           vec!["nvim".into()],
+            layers:         vec!["rofi".into()],
+            layer_contains: vec![],
+        }])
     }
 
-    /// Force-set a specific layout by name (used by the CLI `switch` command).
-    pub fn switch_to(&mut self, cfg: &Config, layout: &str) {
-        self.forced_stack.clear();
-        self.saved_layout = None;
-        self.apply(cfg, layout);
+    /// Helper: apply input, commit, return actions.
+    fn step(engine: &mut Engine, cfg: &Config, input: EngineInput) -> Vec<Action> {
+        let actions = engine.process(cfg, input);
+        engine.commit(&actions);
+        actions
     }
 
-    /// Return the name of the currently active layout, if known.
-    #[allow(dead_code)]
-    pub fn current_layout(&self) -> Option<&str> {
-        self.current.as_deref()
+    fn layout_applied(actions: &[Action]) -> Option<&str> {
+        actions.iter().find_map(|a| {
+            if let Action::ApplyLayout { layout, .. } = a { Some(layout.as_str()) } else { None }
+        })
+    }
+
+    #[test]
+    fn hotkey_rotates() {
+        let cfg = base_cfg();
+        let mut e = Engine::default();
+        e.init("us".into());
+        let actions = step(&mut e, &cfg, EngineInput::Hotkey);
+        assert_eq!(layout_applied(&actions), Some("ru"));
+        let actions = step(&mut e, &cfg, EngineInput::Hotkey);
+        assert_eq!(layout_applied(&actions), Some("us"));
+    }
+
+    #[test]
+    fn force_on_window_and_restore() {
+        let cfg = base_cfg();
+        let mut e = Engine::default();
+        e.init("ru".into());
+
+        // Focus nvim → force us
+        let actions = step(&mut e, &cfg, EngineInput::WindowFocus { class: "nvim".into() });
+        assert_eq!(layout_applied(&actions), Some("us"));
+
+        // Focus firefox → free, restore ru
+        let actions = step(&mut e, &cfg, EngineInput::WindowFocus { class: "firefox".into() });
+        assert_eq!(layout_applied(&actions), Some("ru"));
+    }
+
+    #[test]
+    fn layer_force_nested_in_window_force() {
+        let cfg = base_cfg();
+        let mut e = Engine::default();
+        e.init("ru".into());
+
+        // Focus nvim → us (window forced)
+        step(&mut e, &cfg, EngineInput::WindowFocus { class: "nvim".into() });
+
+        // Open rofi → still us (layer forced, same layout)
+        let actions = step(&mut e, &cfg, EngineInput::LayerOpen { name: "rofi".into() });
+        assert!(layout_applied(&actions).is_none()); // no change needed
+
+        // Close rofi → back to window force (nvim → us)
+        let actions = step(&mut e, &cfg, EngineInput::LayerClose { name: "rofi".into() });
+        assert!(layout_applied(&actions).is_none()); // still us from window force
+
+        // Focus firefox → restore ru
+        let actions = step(&mut e, &cfg, EngineInput::WindowFocus { class: "firefox".into() });
+        assert_eq!(layout_applied(&actions), Some("ru"));
+    }
+
+    #[test]
+    fn external_sync_updates_baseline() {
+        let cfg = base_cfg();
+        let mut e = Engine::default();
+        e.init("us".into());
+
+        // External tool switched to ru.
+        let actions = step(&mut e, &cfg, EngineInput::ExternalSync { layout: "ru".into() });
+        // Only PersistLayout, no ApplyLayout (we don't re-apply what's already active).
+        assert!(layout_applied(&actions).is_none());
+        assert!(actions.iter().any(|a| matches!(a, Action::PersistLayout { .. })));
+
+        // Now hotkey should rotate from ru → us (not us → ru).
+        let actions = step(&mut e, &cfg, EngineInput::Hotkey);
+        assert_eq!(layout_applied(&actions), Some("us"));
+    }
+
+    #[test]
+    fn no_redundant_apply() {
+        let cfg = base_cfg();
+        let mut e = Engine::default();
+        e.init("us".into());
+
+        // Force us again — should produce no actions.
+        let actions = step(&mut e, &cfg, EngineInput::WindowFocus { class: "nvim".into() });
+        assert!(layout_applied(&actions).is_none());
     }
 }

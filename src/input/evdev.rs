@@ -109,6 +109,8 @@ fn set_nonblocking(fd: i32) {
 
 fn find_keyboards() -> Vec<Device> {
     let mut out = Vec::new();
+    let mut denied = 0usize;
+
     let dir = match std::fs::read_dir("/dev/input") {
         Ok(d)  => d,
         Err(e) => { eprintln!("[evdev] read_dir /dev/input: {e}"); return out; }
@@ -133,10 +135,23 @@ fn find_keyboards() -> Vec<Device> {
                 out.push(dev);
             }
             Ok(_)  => {}
-            Err(e) if e.raw_os_error() == Some(libc::EACCES) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EACCES) => { denied += 1; }
             Err(e) => eprintln!("[evdev] open {path:?}: {e}"),
         }
     }
+
+    if out.is_empty() {
+        if denied > 0 {
+            eprintln!(
+                "[evdev] WARNING: no keyboards opened ({denied} device(s) denied — permission error)"
+            );
+            eprintln!("[evdev]   hotkey will not work until you add yourself to the input group:");
+            eprintln!("[evdev]   sudo usermod -aG input $USER  (then re-login)");
+        } else {
+            eprintln!("[evdev] WARNING: no keyboard devices found in /dev/input");
+        }
+    }
+
     out
 }
 

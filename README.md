@@ -17,7 +17,12 @@ hyprxkb init
 exec-once = hyprxkb
 ```
 
-> `/dev/input` access is needed for the lock-screen hotkey — add yourself to the `input` group or install a udev rule.
+> **Hotkey not working?** The lock-screen hotkey reads `/dev/input` directly.
+> Add yourself to the `input` group and re-login:
+> ```bash
+> sudo usermod -aG input $USER
+> ```
+> Or install a udev rule: `KERNEL=="event*", GROUP="input", MODE="0660"` in `/etc/udev/rules.d/70-input.rules`
 
 ## Usage
 

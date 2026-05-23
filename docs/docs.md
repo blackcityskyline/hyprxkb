@@ -33,7 +33,21 @@ key      = "Space"
 | `modifier` | `"Super"` | `Super` `Alt` `Ctrl` `Shift` |
 | `key` | `"Space"` | `Space` `Tab` `Grave` `Minus` `Equal` `F1`–`F12` `Left` `Right` `Up` `Down` |
 
-The hotkey is read from raw `/dev/input`, so it works on the lock screen. Requires access to the `input` group.
+The hotkey is read from raw `/dev/input`, so it works on the lock screen.
+
+Requires access to the `input` group. If the hotkey does nothing, hyprxkb will print a warning on startup:
+
+```
+[evdev] WARNING: no keyboards opened (N device(s) denied — permission error)
+[evdev]   hotkey will not work until you add yourself to the input group:
+[evdev]   sudo usermod -aG input $USER  (then re-login)
+```
+
+Fix:
+```bash
+sudo usermod -aG input $USER
+# re-login or reboot
+```
 
 ---
 
@@ -44,7 +58,7 @@ Keys must match XKB identifiers from `keyboard.layouts`.
 
 ```toml
 [labels]
-us = "🇺🇸 English" # or any custom label
+us = "🇺🇸 English"
 ru = "🇷🇺 Russian"
 de = "🇩🇪 Deutsch"
 ```
@@ -129,8 +143,8 @@ Rules are evaluated top-to-bottom; the first match wins.
 ```toml
 [[force_layout.rules]]
 layout = "us"
-apps   = ["nvim", "vim", "vscode", "alacritty", "*term*"]
-layers = ["rofi", "wofi", "fuzzel"]
+apps   = ["nvim", "vim", "org.telegram.*", "*term*"]
+layers = ["rofi", "wofi"]
 layer_contains = ["launcher", "runner"]
 ```
 
